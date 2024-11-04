@@ -3,12 +3,21 @@ import requests
 import argparse
 from urllib.parse import urlparse
 from typing import Dict, List, Optional
+import sys
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SwaggerToPostmanConverter:
     def __init__(self, swagger_url: str, headers: Dict[str, str]):
         self.swagger_url = swagger_url
         self.headers = headers
         self.swagger_data = None
+        self.processed_refs = set()
+        self.max_recursion_depth = 10
+        self.components = {}  # Store component schemas
+        self.circular_refs = set()  # Track circular references
         
     def fetch_swagger_definition(self) -> None:
         """Fetch the Swagger definition from the URL"""
@@ -16,6 +25,10 @@ class SwaggerToPostmanConverter:
             response = requests.get(self.swagger_url, headers=self.headers)
             response.raise_for_status()
             self.swagger_data = response.json()
+            # Store components for reference resolution
+            self.components = self.swagger_data.get('components', {}).get('schemas', {})
+            if not self.components and 'definitions' in self.swagger_data:  # Support Swagger 2.0
+                self.components = self.swagger_data['definitions']
         except requests.exceptions.RequestException as e:
             raise Exception(f"Failed to fetch Swagger definition: {str(e)}")
 
@@ -26,30 +39,131 @@ class SwaggerToPostmanConverter:
         parsed_url = urlparse(self.swagger_url)
         return f"{parsed_url.scheme}://{parsed_url.netloc}"
 
-    def generate_example_from_schema(self, schema: Dict) -> any:
-        """Generate example data from JSON schema"""
-        if 'type' not in schema:
+    def resolve_ref(self, ref: str, depth: int = 0, path: Optional[List[str]] = None) -> Dict:
+        """Resolve schema reference with improved circular reference handling"""
+        if path is None:
+            path = []
+
+        if depth >= self.max_recursion_depth:
+            return {"type": "string", "example": f"[Max depth reached for: {ref}]"}
+        
+        # If we've seen this ref in the current resolution path, we have a circular reference
+        if ref in path:
+            self.circular_refs.add(ref)
+            return {"type": "string", "example": f"[Circular reference: {ref}]"}
+        
+        try:
+            # For Swagger 2.0 references
+            if ref.startswith('#/definitions/'):
+                schema_name = ref.split('/')[-1]
+                if schema_name in self.components:
+                    schema = self.components[schema_name]
+                    if isinstance(schema, dict):
+                        if '$ref' in schema:
+                            return self.resolve_ref(schema['$ref'], depth + 1, path + [ref])
+                        # Create a simplified version of the schema for circular references
+                        return self.simplify_schema(schema, depth + 1, path + [ref])
+                    return schema
+            
+            # For OpenAPI 3.0 references
+            elif ref.startswith('#/components/schemas/'):
+                schema_name = ref.split('/')[-1]
+                if schema_name in self.components:
+                    schema = self.components[schema_name]
+                    if isinstance(schema, dict):
+                        if '$ref' in schema:
+                            return self.resolve_ref(schema['$ref'], depth + 1, path + [ref])
+                        return self.simplify_schema(schema, depth + 1, path + [ref])
+                    return schema
+            
+            # Handle full reference path
+            ref_path = ref.split('/')
+            ref_schema = self.swagger_data
+            for path_part in ref_path[1:]:
+                ref_schema = ref_schema[path_part]
+            return self.simplify_schema(ref_schema, depth + 1, path + [ref])
+            
+        except (KeyError, IndexError) as e:
+            logger.error(f"Failed to resolve reference {ref}: {str(e)}")
+            return {"type": "string", "example": f"[Failed to resolve: {ref}]"}
+
+    def simplify_schema(self, schema: Dict, depth: int, path: List[str]) -> Dict:
+        """Simplify schema by handling nested structures and references"""
+        if not isinstance(schema, dict):
+            return schema
+
+        # For simple types, return as is
+        if 'type' in schema and schema['type'] in ['string', 'number', 'integer', 'boolean']:
+            return schema
+
+        # For objects, create a simplified version
+        if schema.get('type') == 'object' or 'properties' in schema:
+            simplified = {'type': 'object', 'properties': {}}
+            for prop_name, prop_schema in schema.get('properties', {}).items():
+                if isinstance(prop_schema, dict) and '$ref' in prop_schema:
+                    if prop_schema['$ref'] in path:
+                        simplified['properties'][prop_name] = {
+                            'type': 'string',
+                            'example': f"[Circular reference to: {prop_schema['$ref']}]"
+                        }
+                    else:
+                        simplified['properties'][prop_name] = self.resolve_ref(
+                            prop_schema['$ref'], depth + 1, path
+                        )
+                else:
+                    simplified['properties'][prop_name] = prop_schema
+            return simplified
+
+        # For arrays, simplify the items
+        if schema.get('type') == 'array' and 'items' in schema:
+            if isinstance(schema['items'], dict) and '$ref' in schema['items']:
+                if schema['items']['$ref'] in path:
+                    return {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                            'example': f"[Circular reference to: {schema['items']['$ref']}]"
+                        }
+                    }
+                else:
+                    return {
+                        'type': 'array',
+                        'items': self.resolve_ref(schema['items']['$ref'], depth + 1, path)
+                    }
+            return schema
+
+        return schema
+
+    def generate_example_from_schema(self, schema: Dict, depth: int = 0) -> any:
+        """Generate example data from JSON schema with recursion protection"""
+        if not schema or not isinstance(schema, dict):
             return {}
+
+        if depth >= self.max_recursion_depth:
+            return {"error": "Max recursion depth exceeded"}
+
+        # Handle referenced schemas
+        if '$ref' in schema:
+            resolved_schema = self.resolve_ref(schema['$ref'])
+            return self.generate_example_from_schema(resolved_schema, depth + 1)
+
+        # Check for example or default value first
+        if 'example' in schema:
+            return schema['example']
+        if 'default' in schema:
+            return schema['default']
+
+        schema_type = schema.get('type', 'object')
         
-        if schema['type'] == 'object':
-            result = {}
-            if 'properties' in schema:
-                for prop, prop_schema in schema['properties'].items():
-                    result[prop] = self.generate_example_from_schema(prop_schema)
-            return result
-        
-        elif schema['type'] == 'array':
-            if 'items' in schema:
-                return [self.generate_example_from_schema(schema['items'])]
-            return []
-        
+        # Default values for different types
         type_examples = {
-            'string': "string",
-            'number': 0,
+            'string': schema.get('format', 'string'),
             'integer': 0,
-            'boolean': False
+            'number': 0.0,
+            'boolean': False,
+            'null': None
         }
-        return type_examples.get(schema['type'])
+        return type_examples.get(schema_type, '')
 
     def create_request_item(self, path: str, method: str, operation: Dict, base_url: str) -> Dict:
         """Create a Postman request item from Swagger operation"""
@@ -73,40 +187,30 @@ class SwaggerToPostmanConverter:
         # Add parameters
         if 'parameters' in operation:
             for param in operation['parameters']:
-                if param['in'] == 'query':
+                if isinstance(param, dict) and '$ref' in param:
+                    param = self.resolve_ref(param['$ref'])
+                
+                param_schema = param.get('schema', {})
+                try:
+                    example_value = self.generate_example_from_schema(param_schema) if param_schema else ""
+                except Exception as e:
+                    logger.warning(f"Failed to generate parameter example: {str(e)}")
+                    example_value = "example"
+                
+                if param.get('in') == 'query':
                     request['request']['url']['query'].append({
                         "key": param['name'],
-                        "value": "",
+                        "value": str(example_value),
                         "description": param.get('description', ''),
                         "disabled": not param.get('required', False)
                     })
-                elif param['in'] == 'header':
+                elif param.get('in') == 'header':
                     request['request']['header'].append({
                         "key": param['name'],
-                        "value": "",
+                        "value": str(example_value),
                         "description": param.get('description', ''),
                         "disabled": not param.get('required', False)
                     })
-
-        # Add request body if present
-        if 'requestBody' in operation:
-            content_type = list(operation['requestBody']['content'].keys())[0]
-            schema = operation['requestBody']['content'][content_type].get('schema', {})
-            
-            request['request']['body'] = {
-                "mode": "raw",
-                "raw": json.dumps(self.generate_example_from_schema(schema), indent=2),
-                "options": {
-                    "raw": {
-                        "language": "json" if "json" in content_type else "text"
-                    }
-                }
-            }
-            
-            request['request']['header'].append({
-                "key": "Content-Type",
-                "value": content_type
-            })
 
         return request
 
@@ -124,7 +228,6 @@ class SwaggerToPostmanConverter:
             else:
                 untagged.append(request)
 
-        # Create folders for each tag
         organized_items = []
         for tag, requests in tag_groups.items():
             organized_items.append({
@@ -132,7 +235,6 @@ class SwaggerToPostmanConverter:
                 "item": requests
             })
 
-        # Add untagged requests
         if untagged:
             organized_items.append({
                 "name": "Other",
@@ -146,7 +248,6 @@ class SwaggerToPostmanConverter:
         self.fetch_swagger_definition()
         base_url = self.get_base_url()
         
-        # Initialize Postman collection
         postman_collection = {
             "info": {
                 "name": self.swagger_data.get('info', {}).get('title', 'API Collection'),
@@ -156,7 +257,6 @@ class SwaggerToPostmanConverter:
             "item": []
         }
 
-        # Convert paths to requests
         requests = []
         for path, path_data in self.swagger_data.get('paths', {}).items():
             for method, operation in path_data.items():
@@ -165,9 +265,12 @@ class SwaggerToPostmanConverter:
                     request['tags'] = operation['tags']
                 requests.append(request)
 
-        # Organize requests by tags
         postman_collection['item'] = self.organize_by_tags(requests)
         
+        # Log summary of circular references found
+        if self.circular_refs:
+            logger.info(f"Found {len(self.circular_refs)} circular references in the schema")
+            
         return postman_collection
 
 def main():
@@ -175,10 +278,13 @@ def main():
     parser.add_argument('--url', required=True, help='Swagger JSON URL')
     parser.add_argument('--header', action='append', help='Headers in format key:value')
     parser.add_argument('--output', default='postman_collection.json', help='Output file name')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
     
-    # Parse headers
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     headers = {}
     if args.header:
         for header in args.header:
@@ -189,7 +295,6 @@ def main():
         converter = SwaggerToPostmanConverter(args.url, headers)
         postman_collection = converter.convert()
         
-        # Save to file
         with open(args.output, 'w') as f:
             json.dump(postman_collection, f, indent=2)
         
